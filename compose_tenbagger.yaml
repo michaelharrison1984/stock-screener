@@ -1,0 +1,3173 @@
+services:
+  stock-screener:
+    image: python:3.12-slim
+    container_name: stock-screener
+    restart: unless-stopped
+
+    ports:
+      - "8095:8095"
+
+    environment:
+      PYTHONUNBUFFERED: "1"
+
+      APP_PY: |
+        from flask import Flask, jsonify, request, send_from_directory
+        import yfinance as yf
+        from yfinance import EquityQuery
+        import pandas as pd
+        import math
+        import time
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from urllib.parse import quote
+
+        app = Flask(__name__, static_folder="/app/static")
+
+        # ============================================================
+        # CONFIG
+        # ============================================================
+
+        CACHE_SECONDS = 3600
+        MAX_ENRICH = 280
+        DISCOVERY_PER_LANE = 35
+
+        cache = {}
+        cache_lock = threading.Lock()
+
+        fx_cache = {}
+        fx_lock = threading.Lock()
+
+        REGIONS = {
+            "global": [
+                "us", "gb", "ca",
+                "de", "fr", "nl", "ch", "se", "dk", "no", "fi",
+                "es", "it", "be", "at", "ie",
+                "jp", "kr", "au", "hk", "sg", "tw", "in", "nz"
+            ],
+
+            "us": ["us"],
+            "gb": ["gb"],
+            "ca": ["ca"],
+
+            "europe": [
+                "de", "fr", "nl", "ch", "se", "dk", "no", "fi",
+                "es", "it", "be", "at", "ie"
+            ],
+
+            "japan": ["jp"],
+            "korea": ["kr"],
+            "australia": ["au"],
+
+            "asia": [
+                "jp", "kr", "au", "hk", "sg", "tw", "in", "nz"
+            ],
+
+            "emerging": [
+                "in", "br", "mx", "za", "id", "my", "th", "ph"
+            ]
+        }
+
+        REGION_NAMES = {
+            "us": "United States",
+            "gb": "United Kingdom",
+            "ca": "Canada",
+            "de": "Germany",
+            "fr": "France",
+            "nl": "Netherlands",
+            "ch": "Switzerland",
+            "se": "Sweden",
+            "dk": "Denmark",
+            "no": "Norway",
+            "fi": "Finland",
+            "es": "Spain",
+            "it": "Italy",
+            "be": "Belgium",
+            "at": "Austria",
+            "ie": "Ireland",
+            "jp": "Japan",
+            "kr": "South Korea",
+            "au": "Australia",
+            "hk": "Hong Kong",
+            "sg": "Singapore",
+            "tw": "Taiwan",
+            "in": "India",
+            "nz": "New Zealand",
+            "br": "Brazil",
+            "mx": "Mexico",
+            "za": "South Africa",
+            "id": "Indonesia",
+            "my": "Malaysia",
+            "th": "Thailand",
+            "ph": "Philippines"
+        }
+
+        SECTORS = [
+            "Basic Materials",
+            "Communication Services",
+            "Consumer Cyclical",
+            "Consumer Defensive",
+            "Energy",
+            "Financial Services",
+            "Healthcare",
+            "Industrials",
+            "Real Estate",
+            "Technology",
+            "Utilities"
+        ]
+
+        PRESETS = {
+            "opportunity": {
+                "name": "Opportunity",
+                "quality_weight": 40,
+                "value_weight": 40,
+                "growth_weight": 20,
+                "min_score": 60,
+                "min_cap": 500,
+                "max_cap": 0
+            },
+
+            "deepvalue": {
+                "name": "Deep Value",
+                "quality_weight": 25,
+                "value_weight": 60,
+                "growth_weight": 15,
+                "min_score": 58,
+                "min_cap": 300,
+                "max_cap": 0
+            },
+
+            "compounder": {
+                "name": "Quality Compounder",
+                "quality_weight": 60,
+                "value_weight": 20,
+                "growth_weight": 20,
+                "min_score": 65,
+                "min_cap": 750,
+                "max_cap": 0
+            },
+
+            "growthvalue": {
+                "name": "Growth at Value",
+                "quality_weight": 35,
+                "value_weight": 25,
+                "growth_weight": 40,
+                "min_score": 60,
+                "min_cap": 500,
+                "max_cap": 0
+            },
+
+            "smallcap": {
+                "name": "Small Cap Opportunity",
+                "quality_weight": 45,
+                "value_weight": 35,
+                "growth_weight": 20,
+                "min_score": 55,
+                "min_cap": 100,
+                "max_cap": 1500
+            },
+
+            "tenbagger": {
+                "name": "Tenbagger / Lynch",
+                "quality_weight": 25,
+                "value_weight": 20,
+                "growth_weight": 55,
+                "min_score": 58,
+                "min_cap": 150,
+                "max_cap": 7500
+            }
+        }
+
+        # ============================================================
+        # BASIC HELPERS
+        # ============================================================
+
+        def valid_number(value):
+            try:
+                if value is None:
+                    return False
+                value = float(value)
+                return math.isfinite(value)
+            except Exception:
+                return False
+
+
+        def num(value):
+            if valid_number(value):
+                return float(value)
+            return None
+
+
+        def clamp(value, low=0, high=100):
+            if value is None:
+                return None
+            return max(low, min(high, value))
+
+
+        def percent_display(value):
+            if value is None:
+                return None
+            return value * 100
+
+
+        def weighted_score(parts):
+            total_weight = 0
+            total_score = 0
+
+            for score, weight in parts:
+                if score is None:
+                    continue
+
+                total_score += score * weight
+                total_weight += weight
+
+            if total_weight == 0:
+                return None
+
+            return total_score / total_weight
+
+
+        def safe_info(ticker):
+            try:
+                info = ticker.info
+                return info if isinstance(info, dict) else {}
+            except Exception:
+                return {}
+
+
+        def safe_statement(ticker, attribute):
+            try:
+                frame = getattr(ticker, attribute)
+                if frame is None:
+                    return pd.DataFrame()
+                return frame
+            except Exception:
+                return pd.DataFrame()
+
+
+        def statement_values(frame, names, max_years=5):
+            if frame is None or frame.empty:
+                return []
+
+            for name in names:
+                if name not in frame.index:
+                    continue
+
+                try:
+                    series = frame.loc[name].dropna()
+
+                    # Yahoo normally returns newest year first.
+                    vals = []
+
+                    for value in list(series.values)[::-1]:
+                        if valid_number(value):
+                            vals.append(float(value))
+
+                    return vals[-max_years:]
+
+                except Exception:
+                    pass
+
+            return []
+
+
+        def latest_statement_value(frame, names):
+            vals = statement_values(frame, names, 5)
+
+            if not vals:
+                return None
+
+            return vals[-1]
+
+
+        def cagr(values):
+            vals = [v for v in values if valid_number(v)]
+
+            if len(vals) < 2:
+                return None
+
+            start = vals[0]
+            end = vals[-1]
+            periods = len(vals) - 1
+
+            if start <= 0 or end <= 0 or periods <= 0:
+                return None
+
+            try:
+                return (end / start) ** (1 / periods) - 1
+            except Exception:
+                return None
+
+
+        # ============================================================
+        # GBP MARKET CAP NORMALISATION
+        # ============================================================
+
+        def get_fx_to_gbp(currency):
+            if not currency:
+                return None
+
+            currency = str(currency).upper()
+
+            if currency == "GBP":
+                return 1.0
+
+            # Yahoo occasionally reports London quote currency as GBp/GBX.
+            if currency in ("GBPENCE", "GBX", "GBP.", "GBPENNY", "GBPENCE"):
+                return 0.01
+
+            now = time.time()
+
+            with fx_lock:
+                cached = fx_cache.get(currency)
+
+                if cached and now - cached["time"] < 3600:
+                    return cached["rate"]
+
+            try:
+                pair = currency + "GBP=X"
+                ticker = yf.Ticker(pair)
+
+                price = None
+
+                try:
+                    price = ticker.fast_info["last_price"]
+                except Exception:
+                    pass
+
+                if not valid_number(price):
+                    hist = ticker.history(period="5d")
+
+                    if not hist.empty:
+                        price = hist["Close"].dropna().iloc[-1]
+
+                if valid_number(price):
+                    rate = float(price)
+
+                    with fx_lock:
+                        fx_cache[currency] = {
+                            "rate": rate,
+                            "time": now
+                        }
+
+                    return rate
+
+            except Exception:
+                pass
+
+            return None
+
+
+        def market_cap_gbp(market_cap, currency):
+            if not valid_number(market_cap):
+                return None
+
+            rate = get_fx_to_gbp(currency)
+
+            if rate is None:
+                return None
+
+            return float(market_cap) * rate
+
+
+        # ============================================================
+        # SCORE COMPONENTS
+        # ============================================================
+
+        def score_roic(value):
+            if value is None:
+                return None
+
+            # value supplied as decimal: 0.15 = 15%
+            pct = value * 100
+
+            if pct <= 3:
+                return 0
+            if pct >= 25:
+                return 100
+
+            return clamp((pct - 3) / 22 * 100)
+
+
+        def score_roe(value):
+            if value is None:
+                return None
+
+            pct = value * 100
+
+            if pct <= 0:
+                return 0
+            if pct >= 25:
+                return 100
+
+            return clamp(pct / 25 * 100)
+
+
+        def score_margin(value):
+            if value is None:
+                return None
+
+            pct = value * 100
+
+            if pct <= 0:
+                return 0
+            if pct >= 25:
+                return 100
+
+            return clamp(pct / 25 * 100)
+
+
+        def score_debt_equity(value):
+            if value is None:
+                return None
+
+            # yfinance usually reports 50 as 50%, not 0.50.
+            if value <= 20:
+                return 100
+            if value >= 160:
+                return 0
+
+            return clamp(100 - ((value - 20) / 140 * 100))
+
+
+        def score_pe(value):
+            if value is None or value <= 0:
+                return None
+
+            if value <= 8:
+                return 100
+            if value <= 12:
+                return 90
+            if value <= 16:
+                return 78
+            if value <= 20:
+                return 65
+            if value <= 25:
+                return 52
+            if value <= 35:
+                return 35
+            if value <= 50:
+                return 18
+
+            return 5
+
+
+        def score_fcf_yield(value):
+            if value is None:
+                return None
+
+            pct = value * 100
+
+            if pct >= 10:
+                return 100
+            if pct >= 7:
+                return 88
+            if pct >= 5:
+                return 74
+            if pct >= 3:
+                return 55
+            if pct >= 1:
+                return 30
+            if pct >= 0:
+                return 10
+
+            return 0
+
+
+        def score_peg(value):
+            if value is None or value <= 0:
+                return None
+
+            if value <= 0.7:
+                return 100
+            if value <= 1.0:
+                return 90
+            if value <= 1.5:
+                return 70
+            if value <= 2:
+                return 50
+            if value <= 3:
+                return 25
+
+            return 10
+
+
+        def score_ev_ebitda(value):
+            if value is None or value <= 0:
+                return None
+
+            if value <= 6:
+                return 100
+            if value <= 9:
+                return 85
+            if value <= 12:
+                return 70
+            if value <= 16:
+                return 50
+            if value <= 22:
+                return 30
+
+            return 10
+
+
+        def score_price_book(value):
+            if value is None or value <= 0:
+                return None
+
+            if value <= 1:
+                return 100
+            if value <= 1.5:
+                return 85
+            if value <= 2:
+                return 70
+            if value <= 3:
+                return 50
+            if value <= 5:
+                return 25
+
+            return 10
+
+
+        def score_growth(value):
+            if value is None:
+                return None
+
+            # -5% = 0, 25% = 100
+            return clamp((value + 0.05) / 0.30 * 100)
+
+
+        def score_cagr(value):
+            return score_growth(value)
+
+
+        # ============================================================
+        # ROIC + EARNINGS STABILITY
+        # ============================================================
+
+        def calculate_roic(income, balance):
+            operating_income = latest_statement_value(
+                income,
+                ["Operating Income", "OperatingIncome"]
+            )
+
+            equity = latest_statement_value(
+                balance,
+                [
+                    "Stockholders Equity",
+                    "StockholdersEquity",
+                    "Total Stockholder Equity",
+                    "Total Equity Gross Minority Interest"
+                ]
+            )
+
+            debt = latest_statement_value(
+                balance,
+                [
+                    "Total Debt",
+                    "TotalDebt",
+                    "Long Term Debt And Capital Lease Obligation"
+                ]
+            )
+
+            cash = latest_statement_value(
+                balance,
+                [
+                    "Cash Cash Equivalents And Short Term Investments",
+                    "Cash And Cash Equivalents",
+                    "Cash"
+                ]
+            )
+
+            tax_provision = latest_statement_value(
+                income,
+                ["Tax Provision", "TaxProvision"]
+            )
+
+            pretax_income = latest_statement_value(
+                income,
+                [
+                    "Pretax Income",
+                    "PretaxIncome",
+                    "Income Before Tax"
+                ]
+            )
+
+            if operating_income is None or equity is None:
+                return None
+
+            if debt is None:
+                debt = 0
+
+            if cash is None:
+                cash = 0
+
+            tax_rate = 0.21
+
+            if (
+                tax_provision is not None
+                and pretax_income is not None
+                and pretax_income > 0
+            ):
+                tax_rate = clamp(
+                    tax_provision / pretax_income,
+                    0,
+                    0.35
+                )
+
+            invested_capital = equity + debt - cash
+
+            if invested_capital <= 0:
+                return None
+
+            nopat = operating_income * (1 - tax_rate)
+
+            return nopat / invested_capital
+
+
+        def earnings_stability(income):
+            earnings = statement_values(
+                income,
+                ["Net Income", "NetIncome"],
+                max_years=4
+            )
+
+            if len(earnings) < 2:
+                return None
+
+            positive_ratio = (
+                len([x for x in earnings if x > 0]) / len(earnings)
+            )
+
+            positive_score = positive_ratio * 60
+
+            major_drops = 0
+            comparisons = 0
+
+            for old, new in zip(earnings[:-1], earnings[1:]):
+                if old <= 0:
+                    continue
+
+                comparisons += 1
+                change = (new - old) / abs(old)
+
+                if change < -0.35:
+                    major_drops += 1
+
+            if comparisons == 0:
+                drop_score = 20
+            else:
+                drop_score = (
+                    1 - major_drops / comparisons
+                ) * 40
+
+            return clamp(positive_score + drop_score)
+
+
+        # ============================================================
+        # TRADINGVIEW SYMBOL
+        # ============================================================
+
+        def tradingview_symbol(symbol):
+            s = symbol.upper()
+
+            suffixes = {
+                ".L": "LSE:",
+                ".TO": "TSX:",
+                ".V": "TSXV:",
+                ".T": "TSE:",
+                ".KS": "KRX:",
+                ".KQ": "KOSDAQ:",
+                ".AX": "ASX:",
+                ".HK": "HKEX:",
+                ".DE": "XETR:",
+                ".PA": "EURONEXT:",
+                ".AS": "EURONEXT:",
+                ".SW": "SIX:",
+                ".ST": "OMXSTO:",
+                ".CO": "OMXCOP:",
+                ".OL": "OSL:",
+                ".HE": "OMXHEX:",
+                ".MI": "MIL:",
+                ".MC": "BME:",
+                ".BR": "EURONEXT:"
+            }
+
+            for suffix, exchange in suffixes.items():
+                if s.endswith(suffix):
+                    base = s[:-len(suffix)]
+                    return exchange + base
+
+            return s
+
+
+        # ============================================================
+        # DISCOVERY
+        # ============================================================
+
+        def build_base_query(region, sector=None, extra=None):
+            rules = [
+                EquityQuery("eq", ["region", region])
+            ]
+
+            if sector:
+                rules.append(
+                    EquityQuery("eq", ["sector", sector])
+                )
+
+            if extra:
+                rules.extend(extra)
+
+            return EquityQuery("and", rules)
+
+
+        def screen_lane(region, sector, name):
+            try:
+
+                if name == "size":
+                    query = build_base_query(region, sector)
+
+                    response = yf.screen(
+                        query,
+                        size=DISCOVERY_PER_LANE,
+                        sortField="intradaymarketcap",
+                        sortAsc=False
+                    )
+
+                elif name == "value":
+                    query = build_base_query(
+                        region,
+                        sector,
+                        [
+                            EquityQuery(
+                                "gt",
+                                ["peratio.lasttwelvemonths", 0]
+                            )
+                        ]
+                    )
+
+                    response = yf.screen(
+                        query,
+                        size=DISCOVERY_PER_LANE,
+                        sortField="peratio.lasttwelvemonths",
+                        sortAsc=True
+                    )
+
+                elif name == "cfo":
+                    query = build_base_query(region, sector)
+
+                    response = yf.screen(
+                        query,
+                        size=DISCOVERY_PER_LANE,
+                        sortField="cashfromoperations1yrgrowth.lasttwelvemonths",
+                        sortAsc=False
+                    )
+
+                elif name == "fcf":
+                    query = build_base_query(region, sector)
+
+                    response = yf.screen(
+                        query,
+                        size=DISCOVERY_PER_LANE,
+                        sortField="leveredfreecashflow1yrgrowth.lasttwelvemonths",
+                        sortAsc=False
+                    )
+
+                elif name == "revenue_growth":
+                    query = build_base_query(region, sector)
+
+                    response = yf.screen(
+                        query,
+                        size=DISCOVERY_PER_LANE,
+                        sortField="totalrevenues1yrgrowth.lasttwelvemonths",
+                        sortAsc=False
+                    )
+
+                else:
+                    return []
+
+                return response.get("quotes", [])
+
+            except Exception as exc:
+                print(
+                    "Discovery lane failed:",
+                    region,
+                    name,
+                    str(exc)
+                )
+                return []
+
+
+        def discover_region(region, sector=None, preset_key="opportunity"):
+            found = {}
+
+            lanes = ["size", "value", "cfo", "fcf"]
+            if preset_key == "tenbagger":
+                lanes = ["size", "revenue_growth", "cfo", "fcf"]
+
+            for lane in lanes:
+                quotes = screen_lane(
+                    region,
+                    sector,
+                    lane
+                )
+
+                for item in quotes:
+                    symbol = item.get("symbol")
+
+                    if not symbol:
+                        continue
+
+                    if symbol not in found:
+                        found[symbol] = {
+                            "symbol": symbol,
+                            "region": region,
+                            "hits": 0,
+                            "quote": item,
+                            "lanes": []
+                        }
+
+                    found[symbol]["hits"] += 1
+                    found[symbol]["lanes"].append(lane)
+
+            return list(found.values())
+
+
+        def candidate_market_cap(candidate):
+            q = candidate.get("quote", {})
+
+            market_cap = (
+                q.get("marketCap")
+                or q.get("intradaymarketcap")
+            )
+
+            currency = (
+                q.get("currency")
+                or q.get("financialCurrency")
+            )
+
+            cap_gbp = market_cap_gbp(
+                market_cap,
+                currency
+            )
+
+            if cap_gbp is None:
+                return None
+
+            return cap_gbp / 1_000_000
+
+
+        def candidate_pe(candidate):
+            q = candidate.get("quote", {})
+
+            for key in [
+                "trailingPE",
+                "peratio",
+                "peratio.lasttwelvemonths"
+            ]:
+                if valid_number(q.get(key)):
+                    return float(q.get(key))
+
+            return None
+
+
+        def candidate_priority(candidate, preset_key="opportunity"):
+            hits = candidate.get("hits", 0)
+            pe = candidate_pe(candidate)
+
+            pe_bonus = 0
+
+            if pe is not None and pe > 0:
+                pe_bonus = max(0, 30 - min(pe, 30))
+
+            if preset_key == "tenbagger":
+                q = candidate.get("quote", {})
+                rev_growth = num(q.get("totalrevenues1yrgrowth.lasttwelvemonths") or q.get("revenueGrowth"))
+                growth_bonus = max(0, min((rev_growth or 0) * 100, 50))
+                return hits * 100 + growth_bonus
+
+            return hits * 100 + pe_bonus
+
+
+        def discover_candidates(
+            regions,
+            sector,
+            min_cap,
+            max_cap,
+            preset_key="opportunity"
+        ):
+            all_candidates = []
+
+            workers = min(6, len(regions))
+
+            with ThreadPoolExecutor(
+                max_workers=max(1, workers)
+            ) as executor:
+
+                futures = {
+                    executor.submit(
+                        discover_region,
+                        region,
+                        sector,
+                        preset_key
+                    ): region
+                    for region in regions
+                }
+
+                for future in as_completed(futures):
+                    try:
+                        all_candidates.extend(
+                            future.result()
+                        )
+                    except Exception as exc:
+                        print(
+                            "Region discovery error:",
+                            exc
+                        )
+
+            # --------------------------------------------------------
+            # Deduplicate
+            # --------------------------------------------------------
+
+            combined = {}
+
+            for item in all_candidates:
+                symbol = item["symbol"]
+
+                if symbol not in combined:
+                    combined[symbol] = item
+                else:
+                    combined[symbol]["hits"] += item["hits"]
+
+                    combined[symbol]["lanes"] = list(
+                        set(
+                            combined[symbol]["lanes"]
+                            + item["lanes"]
+                        )
+                    )
+
+            candidates = list(combined.values())
+
+            # --------------------------------------------------------
+            # Apply GBP cap filter where quote data allows it.
+            #
+            # Unknown cap/currency is NOT rejected here because
+            # enrichment may provide the missing information.
+            # --------------------------------------------------------
+
+            filtered = []
+
+            for candidate in candidates:
+                cap = candidate_market_cap(candidate)
+
+                if cap is not None:
+                    if min_cap and cap < min_cap:
+                        continue
+
+                    if max_cap and max_cap > 0 and cap > max_cap:
+                        continue
+
+                filtered.append(candidate)
+
+            # --------------------------------------------------------
+            # Country balancing.
+            #
+            # This prevents Global from becoming almost entirely
+            # US stocks.
+            # --------------------------------------------------------
+
+            by_region = {}
+
+            for candidate in filtered:
+                region = candidate["region"]
+
+                by_region.setdefault(
+                    region,
+                    []
+                ).append(candidate)
+
+            region_count = max(
+                1,
+                len(by_region)
+            )
+
+            quota = max(
+                10,
+                int(MAX_ENRICH / region_count)
+            )
+
+            selected = []
+
+            for region, items in by_region.items():
+
+                items.sort(
+                    key=lambda x: candidate_priority(x, preset_key),
+                    reverse=True
+                )
+
+                selected.extend(
+                    items[:quota]
+                )
+
+            selected.sort(
+                key=lambda x: candidate_priority(x, preset_key),
+                reverse=True
+            )
+
+            return selected[:MAX_ENRICH]
+
+
+        # ============================================================
+        # COMPANY ENRICHMENT
+        # ============================================================
+
+        def enrich_candidate(candidate, preset_key="opportunity"):
+            symbol = candidate["symbol"]
+            region = candidate["region"]
+
+            try:
+                ticker = yf.Ticker(symbol)
+
+                info = safe_info(ticker)
+
+                income = safe_statement(
+                    ticker,
+                    "income_stmt"
+                )
+
+                balance = safe_statement(
+                    ticker,
+                    "balance_sheet"
+                )
+
+                cashflow = safe_statement(
+                    ticker,
+                    "cashflow"
+                )
+
+                sector = (
+                    info.get("sector")
+                    or candidate.get(
+                        "quote",
+                        {}
+                    ).get("sector")
+                    or "Unknown"
+                )
+
+                is_financial = (
+                    sector == "Financial Services"
+                )
+
+                company = (
+                    info.get("longName")
+                    or info.get("shortName")
+                    or candidate.get(
+                        "quote",
+                        {}
+                    ).get("longName")
+                    or symbol
+                )
+
+                market_cap = num(
+                    info.get("marketCap")
+                )
+
+                currency = (
+                    info.get("currency")
+                    or info.get("financialCurrency")
+                    or candidate.get(
+                        "quote",
+                        {}
+                    ).get("currency")
+                )
+
+                cap_gbp = market_cap_gbp(
+                    market_cap,
+                    currency
+                )
+
+                cap_gbp_m = (
+                    cap_gbp / 1_000_000
+                    if cap_gbp is not None
+                    else None
+                )
+
+                pe = num(
+                    info.get("trailingPE")
+                )
+
+                peg = num(
+                    info.get("pegRatio")
+                )
+
+                ev_ebitda = num(
+                    info.get("enterpriseToEbitda")
+                )
+
+                pb = num(
+                    info.get("priceToBook")
+                )
+
+                roe = num(
+                    info.get("returnOnEquity")
+                )
+
+                operating_margin = num(
+                    info.get("operatingMargins")
+                )
+
+                profit_margin = num(
+                    info.get("profitMargins")
+                )
+
+                debt_equity = num(
+                    info.get("debtToEquity")
+                )
+
+                free_cash_flow = num(
+                    info.get("freeCashflow")
+                )
+
+                revenue_growth = num(
+                    info.get("revenueGrowth")
+                )
+
+                earnings_growth = num(
+                    info.get("earningsGrowth")
+                )
+
+                gross_margin = num(info.get("grossMargins"))
+                forward_pe = num(info.get("forwardPE"))
+                held_insiders = num(info.get("heldPercentInsiders"))
+                held_institutions = num(info.get("heldPercentInstitutions"))
+                shares_outstanding = num(info.get("sharesOutstanding"))
+                shares_short_prior = num(info.get("sharesShortPriorMonth"))
+                total_debt = num(info.get("totalDebt"))
+                total_cash = num(info.get("totalCash"))
+                ebitda = num(info.get("ebitda"))
+
+                net_debt_ebitda = None
+                if total_debt is not None and ebitda is not None and ebitda > 0:
+                    net_debt_ebitda = (total_debt - (total_cash or 0)) / ebitda
+
+                trailing_eps = num(
+                    info.get("trailingEps")
+                )
+
+                fcf_yield = None
+
+                if (
+                    free_cash_flow is not None
+                    and market_cap is not None
+                    and market_cap > 0
+                ):
+                    fcf_yield = (
+                        free_cash_flow / market_cap
+                    )
+
+                roic = calculate_roic(
+                    income,
+                    balance
+                )
+
+                stability = earnings_stability(
+                    income
+                )
+
+                revenue_history = statement_values(
+                    income,
+                    ["Total Revenue", "TotalRevenue"],
+                    max_years=5
+                )
+
+                earnings_history = statement_values(
+                    income,
+                    ["Net Income", "NetIncome"],
+                    max_years=5
+                )
+
+                revenue_cagr = cagr(
+                    revenue_history
+                )
+
+                earnings_cagr = cagr(
+                    earnings_history
+                )
+
+                latest_net_income = (
+                    earnings_history[-1]
+                    if earnings_history
+                    else None
+                )
+
+                # ----------------------------------------------------
+                # QUALITY GATE
+                # ----------------------------------------------------
+
+                reject_reasons = []
+
+                profitable = False
+
+                if (
+                    latest_net_income is not None
+                    and latest_net_income > 0
+                ):
+                    profitable = True
+
+                if (
+                    trailing_eps is not None
+                    and trailing_eps > 0
+                ):
+                    profitable = True
+
+                if (
+                    pe is not None
+                    and pe > 0
+                ):
+                    profitable = True
+
+                if not profitable:
+                    reject_reasons.append(
+                        "No evidence of positive trailing earnings"
+                    )
+
+                if not is_financial:
+
+                    if (
+                        free_cash_flow is not None
+                        and free_cash_flow < 0
+                    ):
+                        reject_reasons.append(
+                            "Negative free cash flow"
+                        )
+
+                    if (
+                        operating_margin is not None
+                        and operating_margin <= 0
+                    ):
+                        reject_reasons.append(
+                            "Negative operating margin"
+                        )
+
+                    if (
+                        roic is not None
+                        and roic < 0.05
+                    ):
+                        reject_reasons.append(
+                            "ROIC below 5%"
+                        )
+
+                    if (
+                        debt_equity is not None
+                        and debt_equity > 150
+                    ):
+                        reject_reasons.append(
+                            "Debt/equity above 150%"
+                        )
+
+                else:
+
+                    if (
+                        roe is not None
+                        and roe <= 0
+                    ):
+                        reject_reasons.append(
+                            "Negative ROE"
+                        )
+
+                    if (
+                        profit_margin is not None
+                        and profit_margin <= 0
+                    ):
+                        reject_reasons.append(
+                            "Negative profit margin"
+                        )
+
+                if len(earnings_history) >= 3:
+                    positive_years = len(
+                        [
+                            x
+                            for x in earnings_history
+                            if x > 0
+                        ]
+                    )
+
+                    if positive_years < 2:
+                        reject_reasons.append(
+                            "Weak multi-year earnings history"
+                        )
+
+                if reject_reasons and preset_key != "tenbagger":
+                    return {
+                        "rejected": True,
+                        "symbol": symbol,
+                        "reasons": reject_reasons
+                    }
+
+                # Lynch mode deliberately tolerates an earlier-stage company, but
+                # still rejects clearly broken balance sheets / economics.
+                if preset_key == "tenbagger":
+                    severe = []
+                    if debt_equity is not None and debt_equity > 250:
+                        severe.append("Debt/equity above 250%")
+                    if revenue_growth is not None and revenue_growth < -0.10:
+                        severe.append("Revenue shrinking more than 10%")
+                    if severe:
+                        return {"rejected": True, "symbol": symbol, "reasons": severe}
+
+                # ----------------------------------------------------
+                # QUALITY SCORE
+                # ----------------------------------------------------
+
+                if is_financial:
+
+                    quality = weighted_score([
+                        (score_roe(roe), 40),
+                        (
+                            score_margin(
+                                profit_margin
+                            ),
+                            30
+                        ),
+                        (stability, 30)
+                    ])
+
+                else:
+
+                    quality = weighted_score([
+                        (score_roic(roic), 30),
+                        (score_roe(roe), 20),
+                        (
+                            score_margin(
+                                operating_margin
+                            ),
+                            20
+                        ),
+                        (
+                            score_debt_equity(
+                                debt_equity
+                            ),
+                            15
+                        ),
+                        (stability, 15)
+                    ])
+
+                # ----------------------------------------------------
+                # VALUE SCORE
+                # ----------------------------------------------------
+
+                if is_financial:
+
+                    value = weighted_score([
+                        (score_pe(pe), 45),
+                        (
+                            score_price_book(pb),
+                            35
+                        ),
+                        (score_peg(peg), 20)
+                    ])
+
+                else:
+
+                    value = weighted_score([
+                        (score_pe(pe), 35),
+                        (
+                            score_fcf_yield(
+                                fcf_yield
+                            ),
+                            35
+                        ),
+                        (score_peg(peg), 15),
+                        (
+                            score_ev_ebitda(
+                                ev_ebitda
+                            ),
+                            15
+                        )
+                    ])
+
+                # ----------------------------------------------------
+                # GROWTH SCORE
+                # ----------------------------------------------------
+
+                growth = weighted_score([
+                    (
+                        score_growth(
+                            revenue_growth
+                        ),
+                        30
+                    ),
+                    (
+                        score_growth(
+                            earnings_growth
+                        ),
+                        30
+                    ),
+                    (
+                        score_cagr(
+                            revenue_cagr
+                        ),
+                        20
+                    ),
+                    (
+                        score_cagr(
+                            earnings_cagr
+                        ),
+                        20
+                    )
+                ])
+
+                # ----------------------------------------------------
+                # TENBAGGER / LYNCH SCORE
+                # ----------------------------------------------------
+
+                tenbagger_score = weighted_score([
+                    (score_growth(revenue_growth), 20),
+                    (score_cagr(revenue_cagr), 15),
+                    (score_growth(earnings_growth), 12),
+                    (score_cagr(earnings_cagr), 8),
+                    (score_peg(peg), 12),
+                    (score_roic(roic), 10),
+                    (score_debt_equity(debt_equity), 8),
+                    (score_margin(gross_margin), 5),
+                    (score_fcf_yield(fcf_yield), 5),
+                    (100 if cap_gbp_m is not None and 300 <= cap_gbp_m <= 3000 else
+                     75 if cap_gbp_m is not None and 150 <= cap_gbp_m <= 7500 else 30, 5)
+                ])
+
+                tenbagger_stage = "Watch"
+                if tenbagger_score is not None:
+                    if tenbagger_score >= 82:
+                        tenbagger_stage = "Scaling"
+                    elif tenbagger_score >= 72:
+                        tenbagger_stage = "Emerging"
+                    elif tenbagger_score >= 62:
+                        tenbagger_stage = "Compounder"
+
+                tenbagger_notes = []
+                if revenue_growth is not None and revenue_growth >= 0.20:
+                    tenbagger_notes.append("Revenue growth above 20%")
+                if revenue_cagr is not None and revenue_cagr >= 0.15:
+                    tenbagger_notes.append("Multi-year revenue CAGR above 15%")
+                if peg is not None and 0 < peg <= 1.0:
+                    tenbagger_notes.append("PEG at or below 1.0")
+                if roic is not None and roic >= 0.15:
+                    tenbagger_notes.append("ROIC above 15%")
+                if net_debt_ebitda is not None and net_debt_ebitda < 1.0:
+                    tenbagger_notes.append("Low net leverage")
+                if cap_gbp_m is not None and 300 <= cap_gbp_m <= 3000:
+                    tenbagger_notes.append("Market cap sits in preferred tenbagger range")
+
+                # ----------------------------------------------------
+                # DATA COMPLETENESS
+                # ----------------------------------------------------
+
+                if is_financial:
+                    relevant = [
+                        roe,
+                        profit_margin,
+                        stability,
+                        pe,
+                        pb,
+                        peg,
+                        revenue_growth,
+                        earnings_growth,
+                        revenue_cagr,
+                        earnings_cagr
+                    ]
+
+                else:
+                    relevant = [
+                        roic,
+                        roe,
+                        operating_margin,
+                        debt_equity,
+                        stability,
+                        pe,
+                        fcf_yield,
+                        peg,
+                        ev_ebitda,
+                        revenue_growth,
+                        earnings_growth,
+                        revenue_cagr,
+                        earnings_cagr
+                    ]
+
+                available = len(
+                    [
+                        value
+                        for value in relevant
+                        if value is not None
+                    ]
+                )
+
+                completeness = round(
+                    available
+                    / len(relevant)
+                    * 100
+                )
+
+                # ----------------------------------------------------
+                # STRENGTHS / CAUTIONS
+                # ----------------------------------------------------
+
+                strengths = []
+                cautions = []
+                missing = []
+
+                if roic is not None:
+                    if roic >= 0.15:
+                        strengths.append(
+                            "Strong return on invested capital"
+                        )
+                    elif roic < 0.08:
+                        cautions.append(
+                            "ROIC is relatively weak"
+                        )
+
+                if roe is not None and roe >= 0.15:
+                    strengths.append(
+                        "Strong return on equity"
+                    )
+
+                if (
+                    fcf_yield is not None
+                    and fcf_yield >= 0.05
+                ):
+                    strengths.append(
+                        "Attractive free-cash-flow yield"
+                    )
+
+                if (
+                    revenue_cagr is not None
+                    and revenue_cagr >= 0.08
+                ):
+                    strengths.append(
+                        "Healthy multi-year revenue growth"
+                    )
+
+                if (
+                    earnings_cagr is not None
+                    and earnings_cagr >= 0.08
+                ):
+                    strengths.append(
+                        "Healthy multi-year earnings growth"
+                    )
+
+                if (
+                    debt_equity is not None
+                    and debt_equity <= 50
+                ):
+                    strengths.append(
+                        "Conservative leverage"
+                    )
+
+                if pe is not None and 0 < pe <= 15:
+                    strengths.append(
+                        "Modest earnings valuation"
+                    )
+
+                if (
+                    revenue_growth is not None
+                    and revenue_growth < 0
+                ):
+                    cautions.append(
+                        "Recent revenue is declining"
+                    )
+
+                if (
+                    earnings_growth is not None
+                    and earnings_growth < 0
+                ):
+                    cautions.append(
+                        "Recent earnings are declining"
+                    )
+
+                if (
+                    debt_equity is not None
+                    and debt_equity > 100
+                ):
+                    cautions.append(
+                        "Leverage deserves investigation"
+                    )
+
+                if (
+                    pe is not None
+                    and pe > 30
+                ):
+                    cautions.append(
+                        "Valuation is relatively demanding"
+                    )
+
+                named_metrics = {
+                    "ROIC": roic,
+                    "ROE": roe,
+                    "P/E": pe,
+                    "FCF yield": fcf_yield,
+                    "revenue CAGR": revenue_cagr,
+                    "earnings CAGR": earnings_cagr
+                }
+
+                for label, metric in named_metrics.items():
+                    if metric is None:
+                        missing.append(label)
+
+                return {
+                    "rejected": False,
+
+                    "symbol": symbol,
+                    "company": company,
+                    "sector": sector,
+                    "industry": info.get(
+                        "industry",
+                        "Unknown"
+                    ),
+
+                    "region": region,
+                    "country": (
+                        info.get("country")
+                        or REGION_NAMES.get(
+                            region,
+                            region.upper()
+                        )
+                    ),
+
+                    "currency": currency,
+
+                    "price": num(
+                        info.get(
+                            "currentPrice",
+                            info.get(
+                                "regularMarketPrice"
+                            )
+                        )
+                    ),
+
+                    "market_cap": market_cap,
+                    "market_cap_gbp_m": cap_gbp_m,
+
+                    "pe": pe,
+                    "peg": peg,
+                    "ev_ebitda": ev_ebitda,
+                    "price_book": pb,
+
+                    "roe": roe,
+                    "roic": roic,
+
+                    "operating_margin": (
+                        operating_margin
+                    ),
+
+                    "profit_margin": (
+                        profit_margin
+                    ),
+
+                    "debt_equity": debt_equity,
+
+                    "free_cash_flow": (
+                        free_cash_flow
+                    ),
+
+                    "fcf_yield": fcf_yield,
+
+                    "revenue_growth": (
+                        revenue_growth
+                    ),
+
+                    "earnings_growth": (
+                        earnings_growth
+                    ),
+
+                    "revenue_cagr": revenue_cagr,
+                    "earnings_cagr": earnings_cagr,
+
+                    "stability": stability,
+
+                    "quality": quality,
+                    "value": value,
+                    "growth": growth,
+                    "tenbagger_score": tenbagger_score,
+                    "tenbagger_stage": tenbagger_stage,
+                    "tenbagger_notes": tenbagger_notes,
+                    "gross_margin": gross_margin,
+                    "forward_pe": forward_pe,
+                    "net_debt_ebitda": net_debt_ebitda,
+                    "held_insiders": held_insiders,
+                    "held_institutions": held_institutions,
+
+                    "data_completeness": (
+                        completeness
+                    ),
+
+                    "strengths": strengths,
+                    "cautions": cautions,
+                    "missing": missing,
+
+                    "discovery_hits": (
+                        candidate.get(
+                            "hits",
+                            0
+                        )
+                    ),
+
+                    "discovery_lanes": (
+                        candidate.get(
+                            "lanes",
+                            []
+                        )
+                    ),
+
+                    "tradingview": (
+                        "https://www.tradingview.com/chart/?symbol="
+                        + quote(
+                            tradingview_symbol(
+                                symbol
+                            )
+                        )
+                    ),
+
+                    "yahoo": (
+                        "https://finance.yahoo.com/quote/"
+                        + quote(symbol)
+                    )
+                }
+
+            except Exception as exc:
+
+                print(
+                    "Enrichment failed:",
+                    symbol,
+                    str(exc)
+                )
+
+                return {
+                    "rejected": True,
+                    "symbol": symbol,
+                    "reasons": [
+                        "Data retrieval failed"
+                    ]
+                }
+
+
+        # ============================================================
+        # API
+        # ============================================================
+
+        @app.route("/api/screen")
+        def api_screen():
+
+            region_key = request.args.get(
+                "region",
+                "global"
+            ).lower()
+
+            sector = request.args.get(
+                "sector",
+                ""
+            ).strip()
+
+            preset_key = request.args.get(
+                "preset",
+                "opportunity"
+            ).lower()
+
+            preset = PRESETS.get(
+                preset_key,
+                PRESETS["opportunity"]
+            )
+
+            try:
+                min_cap = float(
+                    request.args.get(
+                        "min_cap",
+                        preset["min_cap"]
+                    )
+                )
+            except Exception:
+                min_cap = preset["min_cap"]
+
+            try:
+                max_cap = float(
+                    request.args.get(
+                        "max_cap",
+                        preset["max_cap"]
+                    )
+                )
+            except Exception:
+                max_cap = preset["max_cap"]
+
+            try:
+                min_score = float(
+                    request.args.get(
+                        "min_score",
+                        preset["min_score"]
+                    )
+                )
+            except Exception:
+                min_score = preset["min_score"]
+
+            if sector not in SECTORS:
+                sector = None
+
+            regions = REGIONS.get(
+                region_key,
+                REGIONS["global"]
+            )
+
+            cache_key = (
+                region_key,
+                sector,
+                preset_key,
+                min_cap,
+                max_cap,
+                min_score
+            )
+
+            now = time.time()
+
+            with cache_lock:
+                cached = cache.get(
+                    cache_key
+                )
+
+                if (
+                    cached
+                    and now - cached["time"]
+                    < CACHE_SECONDS
+                ):
+                    return jsonify(
+                        cached["data"]
+                    )
+
+            print(
+                "Starting screen:",
+                region_key,
+                sector,
+                preset_key,
+                min_cap,
+                max_cap,
+                min_score
+            )
+
+            candidates = discover_candidates(
+                regions,
+                sector,
+                min_cap,
+                max_cap,
+                preset_key
+            )
+
+            print(
+                "Candidates selected for enrichment:",
+                len(candidates)
+            )
+
+            enriched = []
+
+            with ThreadPoolExecutor(
+                max_workers=6
+            ) as executor:
+
+                futures = [
+                    executor.submit(
+                        enrich_candidate,
+                        candidate,
+                        preset_key
+                    )
+                    for candidate in candidates
+                ]
+
+                for future in as_completed(
+                    futures
+                ):
+                    try:
+                        result = future.result()
+
+                        if (
+                            result
+                            and not result.get(
+                                "rejected",
+                                True
+                            )
+                        ):
+                            enriched.append(
+                                result
+                            )
+
+                    except Exception as exc:
+                        print(
+                            "Future failed:",
+                            exc
+                        )
+
+            results = []
+
+            for stock in enriched:
+
+                cap = stock.get(
+                    "market_cap_gbp_m"
+                )
+
+                if cap is not None:
+
+                    if (
+                        min_cap
+                        and cap < min_cap
+                    ):
+                        continue
+
+                    if (
+                        max_cap
+                        and max_cap > 0
+                        and cap > max_cap
+                    ):
+                        continue
+
+                if preset_key == "tenbagger":
+                    overall = stock.get("tenbagger_score")
+                else:
+                    overall = weighted_score([
+                    (
+                        stock.get("quality"),
+                        preset[
+                            "quality_weight"
+                        ]
+                    ),
+                    (
+                        stock.get("value"),
+                        preset[
+                            "value_weight"
+                        ]
+                    ),
+                    (
+                        stock.get("growth"),
+                        preset[
+                            "growth_weight"
+                        ]
+                    )
+                ])
+
+                if overall is None:
+                    continue
+
+                overall = round(
+                    overall,
+                    1
+                )
+
+                if overall < min_score:
+                    continue
+
+                stock["overall"] = overall
+
+                stock["quality"] = (
+                    round(
+                        stock["quality"],
+                        1
+                    )
+                    if stock["quality"]
+                    is not None
+                    else None
+                )
+
+                stock["value"] = (
+                    round(
+                        stock["value"],
+                        1
+                    )
+                    if stock["value"]
+                    is not None
+                    else None
+                )
+
+                stock["growth"] = (
+                    round(
+                        stock["growth"],
+                        1
+                    )
+                    if stock["growth"]
+                    is not None
+                    else None
+                )
+
+                results.append(stock)
+
+            results.sort(
+                key=lambda x: (
+                    x.get("overall", 0),
+                    x.get(
+                        "data_completeness",
+                        0
+                    )
+                ),
+                reverse=True
+            )
+
+            results = results[:75]
+
+            payload = {
+                "results": results,
+
+                "count": len(results),
+
+                "candidates_scanned": (
+                    len(candidates)
+                ),
+
+                "preset": {
+                    "key": preset_key,
+                    "name": preset["name"],
+                    "quality_weight": (
+                        preset[
+                            "quality_weight"
+                        ]
+                    ),
+                    "value_weight": (
+                        preset[
+                            "value_weight"
+                        ]
+                    ),
+                    "growth_weight": (
+                        preset[
+                            "growth_weight"
+                        ]
+                    )
+                },
+
+                "region": region_key,
+
+                "regions_scanned": regions,
+
+                "market_cap_currency": "GBP",
+
+                "generated": int(time.time())
+            }
+
+            with cache_lock:
+                cache[cache_key] = {
+                    "time": now,
+                    "data": payload
+                }
+
+            return jsonify(payload)
+
+
+        @app.route("/health")
+        def health():
+            return jsonify({
+                "status": "ok",
+                "version": "4.1-tenbagger",
+                "service": "Global Opportunity Stock Screener"
+            })
+
+
+        @app.route("/")
+        def index():
+            return send_from_directory(
+                "/app/static",
+                "index.html"
+            )
+
+
+        if __name__ == "__main__":
+            app.run(
+                host="0.0.0.0",
+                port=8095,
+                threaded=True
+            )
+
+      INDEX_HTML: |
+        <!doctype html>
+        <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+
+          <title>Global Opportunity Stock Screener</title>
+
+          <style>
+            :root {
+              --bg: #1a1b26;
+              --panel: #24283b;
+              --panel2: #1f2335;
+              --border: #414868;
+              --text: #c0caf5;
+              --muted: #9aa5ce;
+              --blue: #7aa2f7;
+              --cyan: #7dcfff;
+              --green: #9ece6a;
+              --yellow: #e0af68;
+              --orange: #ff9e64;
+              --red: #f7768e;
+              --purple: #bb9af7;
+            }
+
+            * {
+              box-sizing: border-box;
+            }
+
+            body {
+              margin: 0;
+              padding: 22px;
+              background: var(--bg);
+              color: var(--text);
+              font-family:
+                Inter,
+                system-ui,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+            }
+
+            h1 {
+              margin: 0 0 4px 0;
+              font-size: 25px;
+            }
+
+            .subtitle {
+              color: var(--muted);
+              margin-bottom: 20px;
+              font-size: 13px;
+            }
+
+            .panel {
+              background: var(--panel);
+              border: 1px solid var(--border);
+              border-radius: 12px;
+              padding: 16px;
+              margin-bottom: 16px;
+            }
+
+            .preset-row {
+              display: flex;
+              gap: 8px;
+              flex-wrap: wrap;
+              margin-bottom: 16px;
+            }
+
+            button {
+              border: 1px solid var(--border);
+              background: var(--panel2);
+              color: var(--text);
+              padding: 9px 13px;
+              border-radius: 8px;
+              cursor: pointer;
+            }
+
+            button:hover {
+              border-color: var(--blue);
+            }
+
+            button.active {
+              background: var(--blue);
+              color: var(--bg);
+              border-color: var(--blue);
+              font-weight: 700;
+            }
+
+            .filters {
+              display: grid;
+              grid-template-columns:
+                repeat(auto-fit,minmax(170px,1fr));
+              gap: 12px;
+              align-items: end;
+            }
+
+            label {
+              display: block;
+              color: var(--muted);
+              font-size: 12px;
+              margin-bottom: 5px;
+            }
+
+            select,
+            input {
+              width: 100%;
+              border: 1px solid var(--border);
+              background: var(--panel2);
+              color: var(--text);
+              border-radius: 7px;
+              padding: 9px;
+            }
+
+            .run {
+              width: 100%;
+              background: var(--green);
+              color: var(--bg);
+              font-weight: 800;
+              border: none;
+            }
+
+            .lens {
+              margin-top: 14px;
+              padding: 10px 12px;
+              background: var(--panel2);
+              border-radius: 8px;
+              font-size: 13px;
+              color: var(--muted);
+            }
+
+            .status {
+              margin: 12px 0;
+              font-size: 13px;
+              color: var(--muted);
+            }
+
+            .table-wrap {
+              overflow-x: auto;
+              border-radius: 10px;
+              border: 1px solid var(--border);
+            }
+
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              min-width: 1500px;
+              background: var(--panel);
+            }
+
+            th {
+              text-align: left;
+              font-size: 11px;
+              text-transform: uppercase;
+              letter-spacing: .04em;
+              color: var(--muted);
+              background: var(--panel2);
+              padding: 10px 8px;
+              position: sticky;
+              top: 0;
+            }
+
+            td {
+              padding: 10px 8px;
+              border-top: 1px solid var(--border);
+              font-size: 13px;
+              vertical-align: middle;
+            }
+
+            tr:hover td {
+              background: rgba(122,162,247,.06);
+            }
+
+            .ticker {
+              color: var(--cyan);
+              font-weight: 800;
+            }
+
+            .company {
+              max-width: 220px;
+            }
+
+            .muted {
+              color: var(--muted);
+            }
+
+            .score {
+              font-weight: 800;
+            }
+
+            .exceptional {
+              color: var(--green);
+            }
+
+            .strong {
+              color: var(--cyan);
+            }
+
+            .interesting {
+              color: var(--yellow);
+            }
+
+            .watch {
+              color: var(--orange);
+            }
+
+            .links a {
+              color: var(--blue);
+              margin-right: 8px;
+              text-decoration: none;
+            }
+
+            .why-btn {
+              font-size: 11px;
+              padding: 6px 8px;
+            }
+
+            #detail {
+              display: none;
+            }
+
+            .detail-grid {
+              display: grid;
+              grid-template-columns:
+                repeat(auto-fit,minmax(170px,1fr));
+              gap: 10px;
+              margin: 12px 0;
+            }
+
+            .detail-card {
+              padding: 12px;
+              background: var(--panel2);
+              border-radius: 8px;
+              border: 1px solid var(--border);
+            }
+
+            .detail-value {
+              font-size: 22px;
+              font-weight: 800;
+              margin-top: 3px;
+            }
+
+            .good {
+              color: var(--green);
+            }
+
+            .warn {
+              color: var(--yellow);
+            }
+
+            .bad {
+              color: var(--red);
+            }
+
+            ul {
+              margin-top: 5px;
+            }
+
+            .footnote {
+              color: var(--muted);
+              font-size: 11px;
+              line-height: 1.5;
+              margin-top: 12px;
+            }
+
+            .loading {
+              animation: pulse 1.3s infinite;
+            }
+
+            @keyframes pulse {
+              0% { opacity: .45; }
+              50% { opacity: 1; }
+              100% { opacity: .45; }
+            }
+
+            @media (max-width: 700px) {
+              body {
+                padding: 10px;
+              }
+            }
+          </style>
+        </head>
+
+        <body>
+
+          <h1>Global Opportunity Stock Screener</h1>
+
+          <div class="subtitle">
+            Quality × Value × Growth · Global discovery · Market caps shown in GBP
+          </div>
+
+          <div class="panel">
+
+            <div class="preset-row">
+              <button
+                class="preset active"
+                data-preset="opportunity">
+                Opportunity
+              </button>
+
+              <button
+                class="preset"
+                data-preset="deepvalue">
+                Deep Value
+              </button>
+
+              <button
+                class="preset"
+                data-preset="compounder">
+                Quality Compounder
+              </button>
+
+              <button
+                class="preset"
+                data-preset="growthvalue">
+                Growth at Value
+              </button>
+
+              <button
+                class="preset"
+                data-preset="smallcap">
+                🐟 Small Cap Opportunity
+              </button>
+
+              <button
+                class="preset"
+                data-preset="tenbagger">
+                🚀 Tenbagger / Lynch
+              </button>
+            </div>
+
+            <div class="filters">
+
+              <div>
+                <label>Region</label>
+
+                <select id="region">
+                  <option value="global">🌍 Global</option>
+                  <option value="gb">🇬🇧 United Kingdom</option>
+                  <option value="us">🇺🇸 United States</option>
+                  <option value="ca">🇨🇦 Canada</option>
+                  <option value="europe">🇪🇺 Europe</option>
+                  <option value="japan">🇯🇵 Japan</option>
+                  <option value="korea">🇰🇷 South Korea</option>
+                  <option value="australia">🇦🇺 Australia</option>
+                  <option value="asia">🌏 Asia-Pacific</option>
+                  <option value="emerging">🌱 Emerging Markets</option>
+                </select>
+              </div>
+
+              <div>
+                <label>Sector</label>
+
+                <select id="sector">
+                  <option value="">All sectors</option>
+                  <option>Basic Materials</option>
+                  <option>Communication Services</option>
+                  <option>Consumer Cyclical</option>
+                  <option>Consumer Defensive</option>
+                  <option>Energy</option>
+                  <option>Financial Services</option>
+                  <option>Healthcare</option>
+                  <option>Industrials</option>
+                  <option>Real Estate</option>
+                  <option>Technology</option>
+                  <option>Utilities</option>
+                </select>
+              </div>
+
+              <div>
+                <label>Minimum Market Cap (£m)</label>
+                <input id="minCap" type="number" value="500" min="0">
+              </div>
+
+              <div>
+                <label>Maximum Market Cap (£m)</label>
+                <input
+                  id="maxCap"
+                  type="number"
+                  value="0"
+                  min="0"
+                  placeholder="0 = no maximum">
+              </div>
+
+              <div>
+                <label>Minimum Overall Score</label>
+                <input
+                  id="minScore"
+                  type="number"
+                  value="60"
+                  min="0"
+                  max="100">
+              </div>
+
+              <div>
+                <button
+                  class="run"
+                  onclick="runScreen()">
+                  Run Screen
+                </button>
+              </div>
+
+            </div>
+
+            <div class="lens" id="lens">
+              Opportunity · Quality 40% · Value 40% · Growth 20%
+            </div>
+
+          </div>
+
+          <div class="panel" id="detail">
+
+            <h2 id="detailTitle"></h2>
+
+            <div
+              class="muted"
+              id="detailSubtitle">
+            </div>
+
+            <div class="detail-grid">
+
+              <div class="detail-card">
+                <div class="muted">Overall</div>
+                <div
+                  class="detail-value"
+                  id="dOverall">
+                </div>
+              </div>
+
+              <div class="detail-card">
+                <div class="muted">Quality</div>
+                <div
+                  class="detail-value"
+                  id="dQuality">
+                </div>
+              </div>
+
+              <div class="detail-card">
+                <div class="muted">Value</div>
+                <div
+                  class="detail-value"
+                  id="dValue">
+                </div>
+              </div>
+
+              <div class="detail-card">
+                <div class="muted">Growth</div>
+                <div
+                  class="detail-value"
+                  id="dGrowth">
+                </div>
+              </div>
+
+            </div>
+
+            <h3>Strengths</h3>
+            <ul id="strengths"></ul>
+
+            <h3>Things to investigate</h3>
+            <ul id="cautions"></ul>
+
+            <h3>Missing / incomplete data</h3>
+            <ul id="missing"></ul>
+
+          </div>
+
+          <div class="status" id="status">
+            Ready.
+          </div>
+
+          <div class="table-wrap">
+
+            <table>
+
+              <thead>
+                <tr>
+                  <th>Ticker</th>
+                  <th>Company</th>
+                  <th>Country</th>
+                  <th>Sector</th>
+                  <th>Overall</th>
+                  <th>Lynch Stage</th>
+                  <th>Quality</th>
+                  <th>Value</th>
+                  <th>Growth</th>
+                  <th>P/E</th>
+                  <th>FCF Yield</th>
+                  <th>ROIC</th>
+                  <th>ROE</th>
+                  <th>Rev CAGR</th>
+                  <th>EPS CAGR</th>
+                  <th>Data</th>
+                  <th>Market Cap</th>
+                  <th>Why?</th>
+                  <th>Links</th>
+                </tr>
+              </thead>
+
+              <tbody id="results"></tbody>
+
+            </table>
+
+          </div>
+
+          <div class="footnote">
+            This is a candidate-discovery tool, not an investment recommendation.
+            Missing Yahoo data is not automatically scored as zero. Global searches
+            balance candidates across countries so the result set is not dominated
+            by the United States. Small-cap candidates require additional research
+            into liquidity, dilution, customer concentration and balance-sheet risk.
+          </div>
+
+          <script>
+            var currentPreset = "opportunity";
+            var currentResults = [];
+
+            var presets = {
+              opportunity: {
+                name: "Opportunity",
+                q: 40,
+                v: 40,
+                g: 20,
+                minCap: 500,
+                maxCap: 0,
+                score: 60
+              },
+
+              deepvalue: {
+                name: "Deep Value",
+                q: 25,
+                v: 60,
+                g: 15,
+                minCap: 300,
+                maxCap: 0,
+                score: 58
+              },
+
+              compounder: {
+                name: "Quality Compounder",
+                q: 60,
+                v: 20,
+                g: 20,
+                minCap: 750,
+                maxCap: 0,
+                score: 65
+              },
+
+              growthvalue: {
+                name: "Growth at Value",
+                q: 35,
+                v: 25,
+                g: 40,
+                minCap: 500,
+                maxCap: 0,
+                score: 60
+              },
+
+              smallcap: {
+                name: "Small Cap Opportunity",
+                q: 45,
+                v: 35,
+                g: 20,
+                minCap: 100,
+                maxCap: 1500,
+                score: 55
+              },
+
+              tenbagger: {
+                name: "Tenbagger / Lynch",
+                q: 25,
+                v: 20,
+                g: 55,
+                minCap: 150,
+                maxCap: 7500,
+                score: 58
+              }
+            };
+
+
+            document
+              .querySelectorAll(".preset")
+              .forEach(function(button) {
+
+                button.addEventListener(
+                  "click",
+                  function() {
+
+                    document
+                      .querySelectorAll(".preset")
+                      .forEach(function(b) {
+                        b.classList.remove(
+                          "active"
+                        );
+                      });
+
+                    button.classList.add(
+                      "active"
+                    );
+
+                    currentPreset =
+                      button.dataset.preset;
+
+                    var p =
+                      presets[currentPreset];
+
+                    document
+                      .getElementById("minCap")
+                      .value = p.minCap;
+
+                    document
+                      .getElementById("maxCap")
+                      .value = p.maxCap;
+
+                    document
+                      .getElementById("minScore")
+                      .value = p.score;
+
+                    updateLens();
+                  }
+                );
+              });
+
+
+            function updateLens() {
+              var p = presets[currentPreset];
+
+              document.getElementById(
+                "lens"
+              ).textContent = currentPreset === "tenbagger"
+                ? "Tenbagger / Lynch · Growth + runway led · £150m–£7.5bn · PEG, ROIC, leverage and scaling economics"
+                : p.name +
+                  " · Quality " +
+                  p.q +
+                  "% · Value " +
+                  p.v +
+                  "% · Growth " +
+                  p.g +
+                  "%";
+            }
+
+
+            function fmt(value, digits) {
+              if (
+                value === null ||
+                value === undefined ||
+                isNaN(value)
+              ) {
+                return "—";
+              }
+
+              return Number(value).toFixed(
+                digits === undefined ? 1 : digits
+              );
+            }
+
+
+            function pct(value) {
+              if (
+                value === null ||
+                value === undefined
+              ) {
+                return "—";
+              }
+
+              return (
+                Number(value * 100).toFixed(1)
+                + "%"
+              );
+            }
+
+
+            function scoreClass(score) {
+              if (score >= 85) {
+                return "exceptional";
+              }
+
+              if (score >= 75) {
+                return "strong";
+              }
+
+              if (score >= 65) {
+                return "interesting";
+              }
+
+              return "watch";
+            }
+
+
+            function scoreLabel(score) {
+              if (score >= 85) {
+                return "Exceptional";
+              }
+
+              if (score >= 75) {
+                return "Strong";
+              }
+
+              if (score >= 65) {
+                return "Interesting";
+              }
+
+              return "Watchlist";
+            }
+
+
+            function capFormat(value) {
+              if (
+                value === null ||
+                value === undefined
+              ) {
+                return "—";
+              }
+
+              if (value >= 1000) {
+                return (
+                  "£" +
+                  (value / 1000).toFixed(1)
+                  + "bn"
+                );
+              }
+
+              return (
+                "£" +
+                value.toFixed(0)
+                + "m"
+              );
+            }
+
+
+            async function runScreen() {
+
+              var status =
+                document.getElementById(
+                  "status"
+                );
+
+              status.textContent =
+                "Screening markets and analysing candidates…";
+
+              status.classList.add(
+                "loading"
+              );
+
+              document.getElementById(
+                "results"
+              ).innerHTML = "";
+
+              document.getElementById(
+                "detail"
+              ).style.display = "none";
+
+              var params =
+                new URLSearchParams();
+
+              params.set(
+                "region",
+                document.getElementById(
+                  "region"
+                ).value
+              );
+
+              params.set(
+                "sector",
+                document.getElementById(
+                  "sector"
+                ).value
+              );
+
+              params.set(
+                "preset",
+                currentPreset
+              );
+
+              params.set(
+                "min_cap",
+                document.getElementById(
+                  "minCap"
+                ).value
+              );
+
+              params.set(
+                "max_cap",
+                document.getElementById(
+                  "maxCap"
+                ).value
+              );
+
+              params.set(
+                "min_score",
+                document.getElementById(
+                  "minScore"
+                ).value
+              );
+
+              try {
+
+                var response = await fetch(
+                  "/api/screen?"
+                  + params.toString()
+                );
+
+                var data =
+                  await response.json();
+
+                currentResults =
+                  data.results || [];
+
+                renderResults(
+                  currentResults
+                );
+
+                status.classList.remove(
+                  "loading"
+                );
+
+                status.textContent =
+                  currentResults.length +
+                  " results · "
+                  + data.candidates_scanned
+                  + " candidates analysed · "
+                  + data.regions_scanned.length
+                  + " market(s) searched.";
+
+              } catch (error) {
+
+                status.classList.remove(
+                  "loading"
+                );
+
+                status.textContent =
+                  "Screen failed: "
+                  + error.message;
+              }
+            }
+
+
+            function renderResults(results) {
+
+              var body =
+                document.getElementById(
+                  "results"
+                );
+
+              body.innerHTML = "";
+
+              results.forEach(
+                function(stock, index) {
+
+                  var row =
+                    document.createElement(
+                      "tr"
+                    );
+
+                  var cls =
+                    scoreClass(
+                      stock.overall
+                    );
+
+                  row.innerHTML =
+                    "<td class='ticker'>"
+                    + stock.symbol
+                    + "</td>"
+
+                    + "<td class='company'>"
+                    + stock.company
+                    + "</td>"
+
+                    + "<td>"
+                    + (stock.country || "—")
+                    + "</td>"
+
+                    + "<td>"
+                    + stock.sector
+                    + "</td>"
+
+                    + "<td class='score "
+                    + cls
+                    + "'>"
+                    + fmt(stock.overall)
+                    + "<br><span class='muted'>"
+                    + scoreLabel(stock.overall)
+                    + "</span></td>"
+
+                    + "<td>"
+                    + (currentPreset === "tenbagger" ? (stock.tenbagger_stage || "Watch") : "—")
+                    + "</td>"
+
+                    + "<td>"
+                    + fmt(stock.quality)
+                    + "</td>"
+
+                    + "<td>"
+                    + fmt(stock.value)
+                    + "</td>"
+
+                    + "<td>"
+                    + fmt(stock.growth)
+                    + "</td>"
+
+                    + "<td>"
+                    + fmt(stock.pe)
+                    + "</td>"
+
+                    + "<td>"
+                    + pct(stock.fcf_yield)
+                    + "</td>"
+
+                    + "<td>"
+                    + pct(stock.roic)
+                    + "</td>"
+
+                    + "<td>"
+                    + pct(stock.roe)
+                    + "</td>"
+
+                    + "<td>"
+                    + pct(stock.revenue_cagr)
+                    + "</td>"
+
+                    + "<td>"
+                    + pct(stock.earnings_cagr)
+                    + "</td>"
+
+                    + "<td>"
+                    + stock.data_completeness
+                    + "%</td>"
+
+                    + "<td>"
+                    + capFormat(
+                      stock.market_cap_gbp_m
+                    )
+                    + "</td>"
+
+                    + "<td>"
+                    + "<button class='why-btn' "
+                    + "onclick='showDetail("
+                    + index
+                    + ")'>Why?</button>"
+                    + "</td>"
+
+                    + "<td class='links'>"
+                    + "<a target='_blank' href='"
+                    + stock.tradingview
+                    + "'>TV</a>"
+                    + "<a target='_blank' href='"
+                    + stock.yahoo
+                    + "'>Yahoo</a>"
+                    + "</td>";
+
+                  body.appendChild(row);
+                }
+              );
+            }
+
+
+            function listInto(id, items, fallback) {
+
+              var el =
+                document.getElementById(id);
+
+              el.innerHTML = "";
+
+              if (!items || items.length === 0) {
+
+                var li =
+                  document.createElement(
+                    "li"
+                  );
+
+                li.textContent = fallback;
+
+                el.appendChild(li);
+
+                return;
+              }
+
+              items.forEach(function(text) {
+
+                var li =
+                  document.createElement(
+                    "li"
+                  );
+
+                li.textContent = text;
+
+                el.appendChild(li);
+              });
+            }
+
+
+            function showDetail(index) {
+
+              var stock =
+                currentResults[index];
+
+              if (!stock) {
+                return;
+              }
+
+              document.getElementById(
+                "detail"
+              ).style.display = "block";
+
+              document.getElementById(
+                "detailTitle"
+              ).textContent =
+                stock.symbol +
+                " — " +
+                stock.company;
+
+              document.getElementById(
+                "detailSubtitle"
+              ).textContent =
+                (stock.country || "") +
+                " · " +
+                stock.sector +
+                " · " +
+                (stock.industry || "") +
+                " · Data completeness "
+                + stock.data_completeness
+                + "%";
+
+              document.getElementById(
+                "dOverall"
+              ).textContent =
+                fmt(stock.overall);
+
+              document.getElementById(
+                "dQuality"
+              ).textContent =
+                fmt(stock.quality);
+
+              document.getElementById(
+                "dValue"
+              ).textContent =
+                fmt(stock.value);
+
+              document.getElementById(
+                "dGrowth"
+              ).textContent =
+                fmt(stock.growth);
+
+              var detailStrengths = (stock.strengths || []).slice();
+              if (currentPreset === "tenbagger" && stock.tenbagger_notes) {
+                detailStrengths = stock.tenbagger_notes.concat(detailStrengths);
+              }
+
+              listInto(
+                "strengths",
+                detailStrengths,
+                "No obvious standout strengths were generated automatically."
+              );
+
+              listInto(
+                "cautions",
+                stock.cautions,
+                "No automatic cautions generated — still complete normal research."
+              );
+
+              listInto(
+                "missing",
+                stock.missing,
+                "No major scoring fields appear to be missing."
+              );
+
+              window.scrollTo({
+                top:
+                  document.getElementById(
+                    "detail"
+                  ).offsetTop - 10,
+                behavior: "smooth"
+              });
+            }
+
+
+            updateLens();
+          </script>
+
+        </body>
+        </html>
+
+    command:
+      - /bin/sh
+      - -c
+      - |
+          mkdir -p /app/static
+
+          printf '%s' "$$APP_PY" > /app/app.py
+          printf '%s' "$$INDEX_HTML" > /app/static/index.html
+
+          pip install --no-cache-dir \
+            flask \
+            yfinance \
+            pandas
+
+          python /app/app.py
